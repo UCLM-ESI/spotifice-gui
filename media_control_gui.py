@@ -3,6 +3,7 @@
 import logging
 import signal
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from time import sleep
 
@@ -10,7 +11,8 @@ import gi
 
 gi.require_version('Gdk', '4.0')
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gdk, Gtk, GLib  # noqa: E402
+gi.require_version('Pango', '1.0')
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 import Ice  # noqa: E402
 
@@ -23,12 +25,32 @@ logger = logging.getLogger(__name__)
 
 TITLE_WIDTH = 45
 POLL_MS = 1000
+ERROR_HOLD_MS = 5000  # keep errors readable in spite of the status polling
+NO_TRACK = "No track loaded"
 
-STATE_NAMES = {
-    Spotifice.PlaybackState.PLAYING: "Playing",
-    Spotifice.PlaybackState.PAUSED: "Paused",
-    Spotifice.PlaybackState.STOPPED: "Stopped",
+ERROR_COLOUR = "#e01b24"  # also the stop colour
+
+# playback state -> (status text, css class, highlight colour)
+STATES = {
+    Spotifice.PlaybackState.PLAYING: ("Playing", "state-play", "#2ec27e"),
+    Spotifice.PlaybackState.PAUSED: ("Paused", "state-pause", "#e5a50a"),
+    Spotifice.PlaybackState.STOPPED: ("Stopped", "state-stop", ERROR_COLOUR),
 }
+
+# repeat is not a playback state, so it uses the theme accent instead
+REPEAT_STYLE = ("state-repeat", "@theme_selected_bg_color")
+
+HIGHLIGHT_CSS = """
+button.{css_class}, button.{css_class}:hover {{
+    background-image: none;
+    background-color: alpha({colour}, 0.35);
+    box-shadow: inset 0 0 0 1px {colour};
+}}"""
+
+ERROR_CSS = f"""
+label.status-error {{
+    color: {ERROR_COLOUR};
+}}"""
 
 
 def get_proxy(ic, property, cls):
@@ -49,11 +71,30 @@ def get_proxy(ic, property, cls):
 
 
 def describe_error(e):
-    "Readable text for Ice user exceptions (Spotifice.Error) and others"
+    "Single line description for Ice user exceptions (Spotifice.Error) and others"
     if isinstance(e, Spotifice.Error):
         item = f" ({e.item})" if e.item else ""
-        return f"{type(e).__name__}: {e.reason}{item}"
-    return str(e)
+        text = f"{type(e).__name__}: {e.reason}{item}"
+    else:
+        text = str(e) or type(e).__name__
+
+    return " ".join(text.split())  # Ice messages span several lines
+
+
+def application_css():
+    "One highlight rule per playback state, plus repeat and the error text"
+    styles = [style for _, *style in STATES.values()] + [REPEAT_STYLE]
+    return ERROR_CSS + "".join(
+        HIGHLIGHT_CSS.format(css_class=css_class, colour=colour)
+        for css_class, colour in styles
+    )
+
+
+def set_css_class(widget, css_class, enabled):
+    if enabled:
+        widget.add_css_class(css_class)
+    else:
+        widget.remove_css_class(css_class)
 
 
 def handle_action_error(func):
@@ -64,7 +105,7 @@ def handle_action_error(func):
         try:
             return func(self, *args)
         except Exception as e:
-            self.update_status(f"Error in {action_name}(): {describe_error(e)}")
+            self.show_error(f"Error in {action_name}(): {describe_error(e)}")
     return wrapper
 
 
@@ -77,16 +118,13 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
         self.provider, self.render = self.init_ice_proxies()
 
         self.track_ids = []
-        self.track_full_text = ""
-        self.track_scroll_offset = 0
-        self.track_animation_timeout = None
-        self._updating_ui = False  # avoid handling signals we trigger ourselves
+        self.updating_ui = False   # ignore signals for changes we make ourselves
+        self.status_pending = False  # a get_status() reply is on its way
+        self.error_until = 0         # monotonic time while an error holds the status bar
 
         self.load_css()
         self.create_ui()
         self.load_tracks()
-        self.load_first_track()
-        self.refresh_status()
         GLib.timeout_add(POLL_MS, self.poll_status)
 
     def init_ice_proxies(self):
@@ -106,30 +144,8 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
 
     @staticmethod
     def load_css():
-        "Highlight active buttons: theme accent for repeat, green/amber/red for play/pause/stop"
         provider = Gtk.CssProvider()
-        provider.load_from_string("""
-            button.active-state, button.active-state:hover {
-                background-image: none;
-                background-color: alpha(@theme_selected_bg_color, 0.35);
-                box-shadow: inset 0 0 0 1px @theme_selected_bg_color;
-            }
-            button.state-play, button.state-play:hover {
-                background-image: none;
-                background-color: alpha(#2ec27e, 0.35);
-                box-shadow: inset 0 0 0 1px #2ec27e;
-            }
-            button.state-pause, button.state-pause:hover {
-                background-image: none;
-                background-color: alpha(#e5a50a, 0.35);
-                box-shadow: inset 0 0 0 1px #e5a50a;
-            }
-            button.state-stop, button.state-stop:hover {
-                background-image: none;
-                background-color: alpha(#e01b24, 0.35);
-                box-shadow: inset 0 0 0 1px #e01b24;
-            }
-        """)
+        provider.load_from_string(application_css())
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -159,13 +175,19 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
         self.stop_button = self._button("media-playback-stop", "Stop", self.on_stop)
         self.repeat_button = self._button(
             "media-playlist-repeat", "Repeat", self.on_repeat, toggle=True)
-        for b in (self.previous_button, self.play_button, self.pause_button,
-                  self.stop_button, self.repeat_button):
-            controls.append(b)
+        for button in (self.previous_button, self.play_button, self.pause_button,
+                       self.stop_button, self.repeat_button):
+            controls.append(button)
+
+        self.state_buttons = {
+            Spotifice.PlaybackState.PLAYING: self.play_button,
+            Spotifice.PlaybackState.PAUSED: self.pause_button,
+            Spotifice.PlaybackState.STOPPED: self.stop_button,
+        }
 
         # current track
-        self.track_label = Gtk.Label(label="No track loaded")
-        self.track_label.set_ellipsize(3)
+        self.track_label = Gtk.Label(label=NO_TRACK)
+        self.track_label.set_ellipsize(Pango.EllipsizeMode.END)
         self.track_label.set_margin_top(10)
         self.track_label.set_selectable(True)
         self.track_label.add_css_class("title-3")
@@ -183,8 +205,8 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
         self.status_label.set_margin_bottom(5)
         statusbar.append(self.status_label)
 
-        for w in (selector, controls, self.track_label, statusbar):
-            box.append(w)
+        for widget in (selector, controls, self.track_label, statusbar):
+            box.append(widget)
         self.set_child(box)
 
     @staticmethod
@@ -197,165 +219,164 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
         button.connect("toggled" if toggle else "clicked", callback)
         return button
 
+    @contextmanager
+    def ui_update(self):
+        "Suppress the handlers of the widgets we are about to update"
+        self.updating_ui = True
+        try:
+            yield
+        finally:
+            self.updating_ui = False
+
     def update_status(self, message):
+        "Routine status, which never hides a recent error"
+        if GLib.get_monotonic_time() < self.error_until:
+            return
+
+        set_css_class(self.status_label, "status-error", False)
+        self.status_label.set_text(message)
+
+    def show_error(self, message):
+        "Error status, held for a while so that the polling cannot hide it"
+        self.error_until = GLib.get_monotonic_time() + ERROR_HOLD_MS * 1000
+        set_css_class(self.status_label, "status-error", True)
         self.status_label.set_text(message)
 
     def update_button_states(self, state):
-        buttons = {
-            Spotifice.PlaybackState.PLAYING: (self.play_button, "state-play"),
-            Spotifice.PlaybackState.PAUSED: (self.pause_button, "state-pause"),
-            Spotifice.PlaybackState.STOPPED: (self.stop_button, "state-stop"),
-        }
-        for button, css_class in buttons.values():
-            button.remove_css_class(css_class)
-
-        if state in buttons:
-            button, css_class = buttons[state]
-            button.add_css_class(css_class)
+        "Highlight the button matching the current playback state"
+        for candidate, button in self.state_buttons.items():
+            set_css_class(button, STATES[candidate][1], candidate == state)
 
     def update_repeat_style(self):
-        "Highlight the repeat button with the theme accent colour while active"
-        if self.repeat_button.get_active():
-            self.repeat_button.add_css_class("active-state")
-        else:
-            self.repeat_button.remove_css_class("active-state")
+        set_css_class(self.repeat_button, REPEAT_STYLE[0], self.repeat_button.get_active())
 
     def set_track_title(self, title):
-        "Show the title, scrolling it if it does not fit"
-        if title == self.track_full_text:
-            return
+        if title != self.track_label.get_text():
+            self.track_label.set_text(title)
+            self.track_label.set_tooltip_text(title)
 
-        if self.track_animation_timeout is not None:
-            GLib.source_remove(self.track_animation_timeout)
-            self.track_animation_timeout = None
+    # ---- Ice calls (asynchronous, to keep the GTK thread responsive) --
 
-        self.track_full_text = title
-        self.track_scroll_offset = 0
-        self.track_label.set_text(title)
+    def ice_call(self, future, action, on_result=None):
+        """Run an Ice invocation without blocking the GTK thread. Its outcome
+        is applied back in that thread, refreshing the status by default."""
+        def done(future):
+            try:
+                result = future.result()
+            except Exception as e:
+                GLib.idle_add(self.on_call_failed, action, e)
+            else:
+                GLib.idle_add(self.on_call_done, result, on_result)
 
-        if len(title) > TITLE_WIDTH:
-            self.track_animation_timeout = GLib.timeout_add(200, self.animate_track_title)
+        future.add_done_callback(done)
 
-    def animate_track_title(self):
-        text = self.track_full_text
-        if len(text) <= TITLE_WIDTH:
-            self.track_animation_timeout = None
-            return False
+    def on_call_failed(self, action, error):
+        self.status_pending = False
+        self.show_error(f"Error in {action}(): {describe_error(error)}")
+        return GLib.SOURCE_REMOVE
 
-        display = text[self.track_scroll_offset:self.track_scroll_offset + TITLE_WIDTH]
-        if len(display) < TITLE_WIDTH:
-            display += " ... " + text[:TITLE_WIDTH - len(display) - 5]
-        self.track_label.set_text(display)
+    def on_call_done(self, result, on_result):
+        if on_result is None:
+            self.refresh_status()
+        else:
+            on_result(result)
+        return GLib.SOURCE_REMOVE
 
-        self.track_scroll_offset = (self.track_scroll_offset + 1) % (len(text) + 5)
-        return True
-
-    # ---- Ice state ---------------------------------------------------
+    # ---- render state ------------------------------------------------
 
     def load_tracks(self):
-        try:
-            tracks = self.provider.get_all_tracks()
-        except Exception as e:
-            logger.error(f"Error loading tracks: {describe_error(e)}")
-            self.update_status(f"Error loading tracks: {describe_error(e)}")
-            return
+        self.ice_call(self.provider.get_all_tracksAsync(), "get_all_tracks", self.apply_tracks)
 
-        self._updating_ui = True
-        try:
+    def apply_tracks(self, tracks):
+        with self.ui_update():
             for track in tracks:
                 self.track_model.append(track.title)
                 self.track_ids.append(track.id)
-            if not tracks:
-                self.update_status("The provider has no tracks")
-            else:
-                self.track_dropdown.set_selected(Gtk.INVALID_LIST_POSITION)
-        finally:
-            self._updating_ui = False
+            self.track_dropdown.set_selected(Gtk.INVALID_LIST_POSITION)
+
+        if not tracks:
+            self.show_error("The provider has no tracks")
+            return
+
+        self.load_first_track()
 
     def load_first_track(self):
-        "Load the first track if the render has none loaded yet"
-        if not self.track_ids:
-            return
-        try:
-            if self.render.get_status().current_track is None:
-                self.render.load_track(self.track_ids[0])
-        except Exception as e:
-            self.update_status(f"Error loading first track: {describe_error(e)}")
+        "Load the first track unless the render already has one"
+        def on_status(status):
+            if status.current_track is None:
+                self.ice_call(self.render.load_trackAsync(self.track_ids[0]), "load_track")
+            else:
+                self.apply_status(status)
+
+        self.ice_call(self.render.get_statusAsync(), "get_status", on_status)
 
     def refresh_status(self):
-        "Synchronise the UI with the render state. Returns False on failure."
-        try:
-            status = self.render.get_status()
-        except Exception as e:
-            self.update_status(f"Render unavailable: {describe_error(e)}")
-            return False
+        "Ask the render for its state; the UI follows when the reply arrives"
+        if self.status_pending:
+            return
+
+        self.status_pending = True
+        self.ice_call(self.render.get_statusAsync(), "get_status", self.apply_status)
+
+    def apply_status(self, status):
+        self.status_pending = False
 
         track = status.current_track
-        self.set_track_title(track.title if track and track.title else "No track loaded")
+        self.set_track_title(track.title if track and track.title else NO_TRACK)
         self.update_button_states(status.state)
 
-        self._updating_ui = True
-        try:
+        with self.ui_update():
             self.repeat_button.set_active(bool(status.is_repeating))
             self.update_repeat_style()
+
             index = Gtk.INVALID_LIST_POSITION
             if track and track.id in self.track_ids:
                 index = self.track_ids.index(track.id)
             if self.track_dropdown.get_selected() != index:
                 self.track_dropdown.set_selected(index)
-        finally:
-            self._updating_ui = False
 
-        self.update_status(STATE_NAMES.get(status.state, "Ready"))
-        return True
+        self.update_status(STATES[status.state][0] if status.state in STATES else "Ready")
 
     def poll_status(self):
         self.refresh_status()
-        return True
+        return GLib.SOURCE_CONTINUE
 
     # ---- actions -----------------------------------------------------
 
+    @handle_action_error
     def on_track_selected(self, dropdown, _pspec):
-        if self._updating_ui:
+        if self.updating_ui:
             return
+
         index = dropdown.get_selected()
         if index == Gtk.INVALID_LIST_POSITION or index >= len(self.track_ids):
             return
 
-        try:
-            self.render.load_track(self.track_ids[index])
-        except Exception as e:
-            self.update_status(f"Error loading track: {describe_error(e)}")
-            return
-        self.refresh_status()
+        self.ice_call(self.render.load_trackAsync(self.track_ids[index]), "load_track")
 
     @handle_action_error
     def on_play(self, button):
-        self.render.play()
-        self.refresh_status()
+        self.ice_call(self.render.playAsync(), "play")
 
     @handle_action_error
     def on_pause(self, button):
-        self.render.pause()
-        self.refresh_status()
+        self.ice_call(self.render.pauseAsync(), "pause")
 
     @handle_action_error
     def on_stop(self, button):
-        self.render.stop()
-        self.refresh_status()
+        self.ice_call(self.render.stopAsync(), "stop")
 
     @handle_action_error
     def on_previous(self, button):
-        self.render.previous()
-        self.refresh_status()
+        self.ice_call(self.render.previousAsync(), "previous")
 
     @handle_action_error
     def on_repeat(self, button):
-        if self._updating_ui:
+        if self.updating_ui:
             return
+
         self.update_repeat_style()
-        self.render.set_repeat(bool(button.get_active()))
-        self.refresh_status()
+        self.ice_call(self.render.set_repeatAsync(button.get_active()), "set_repeat")
 
 
 class SpotificeApp(Gtk.Application):
