@@ -1,0 +1,35 @@
+/* The button matching the current playback state, and the repeat toggle while
+   active, get a tinted background and a thin border of the same colour. */
+
+button.state-play, button.state-play:hover {
+    background-image: none;
+    background-color: alpha(#2ec27e, 0.35);
+    box-shadow: inset 0 0 0 1px #2ec27e;
+}
+
+button.state-pause, button.state-pause:hover {
+    background-image: none;
+    background-color: alpha(#e5a50a, 0.35);
+    box-shadow: inset 0 0 0 1px #e5a50a;
+}
+
+button.state-stop, button.state-stop:hover {
+    background-image: none;
+    background-color: alpha(#e01b24, 0.35);
+    box-shadow: inset 0 0 0 1px #e01b24;
+}
+
+/* repeat is not a playback state, so it uses the theme accent instead */
+button.state-repeat, button.state-repeat:hover {
+    background-image: none;
+    background-color: alpha(@theme_selected_bg_color, 0.35);
+    box-shadow: inset 0 0 0 1px @theme_selected_bg_color;
+}
+
+label.status-error, image.status-error {
+    color: #e01b24;
+}
+
+listbox label {
+    margin: 4px 6px;
+}
