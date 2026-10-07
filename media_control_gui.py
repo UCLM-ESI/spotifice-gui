@@ -39,6 +39,7 @@ MEDIA_RENDER = "media render"
 # the calls the GUI makes by itself, and the server each one needs
 OWN_CALLS = {
     "get_status": MEDIA_RENDER,
+    "get_current_track": MEDIA_RENDER,
     "bind_media_provider": MEDIA_RENDER,
     "get_all_tracks": MEDIA_PROVIDER,
 }
@@ -60,6 +61,7 @@ STATES = {
 }
 
 READY = State("Ready", "", None)  # before the render tells us anything
+BASIC = State("v0 interface: no playback status", "", "dialog-information-symbolic")
 
 
 
@@ -106,6 +108,7 @@ class SpotificeClient:
         self.render = render
         self.on_error = on_error
         self.on_changed = on_changed
+        self.playback_status = None  # whether the render implements get_status()
 
     @classmethod
     def from_communicator(cls, communicator, on_error, on_changed):
@@ -121,8 +124,27 @@ class SpotificeClient:
     def get_all_tracks(self, on_result):
         self.deliver(self.provider.get_all_tracksAsync(), "get_all_tracks", on_result)
 
+    def follow(self, on_status, on_track):
+        """Ask the render where it is: with get_status() when it has it, and with
+        the plain get_current_track() of the v0 interface when it does not."""
+        if self.playback_status is False:
+            self.get_current_track(on_track)
+        else:
+            self.get_status(on_status)
+
     def get_status(self, on_result):
-        self.deliver(self.render.get_statusAsync(), "get_status", on_result)
+        def found(status):
+            self.playback_status = True  # only v1 answers this one
+            on_result(status)
+
+        self.deliver(self.render.get_statusAsync(), "get_status", found)
+
+    def get_current_track(self, on_result):
+        self.deliver(self.render.get_current_trackAsync(), "get_current_track", on_result)
+
+    def forget_interface(self):
+        "The render is gone; the next one may implement another version"
+        self.playback_status = None
 
     def bind_provider(self, on_result):
         self.deliver(self.render.bind_media_providerAsync(self.provider),
@@ -159,6 +181,9 @@ class SpotificeClient:
             try:
                 result = future.result()
             except Exception as e:
+                if isinstance(e, Ice.OperationNotExistException):
+                    self.playback_status = False  # a v0 render lacks this operation
+
                 self.in_gtk_thread(self.on_error, action, e)
             else:
                 self.in_gtk_thread(on_result, result)
@@ -339,8 +364,17 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
 
     def on_call_failed(self, action, error):
         self.status_pending = False
+
+        if isinstance(error, Ice.OperationNotExistException):
+            # the render is there, it just does not implement this operation
+            logger.info(f"The render has no {action}(): it implements the v0 interface")
+            if action == "get_status":
+                self.refresh_status()  # ask again, the way a v0 render understands
+            return
+
         if isinstance(error, Ice.LocalException):
             self.ready = False  # the render is gone; the next one may be a new process
+            self.client.forget_interface()
 
         server = OWN_CALLS.get(action)
         if server:
@@ -380,14 +414,13 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
         self.load_first_track()
 
     def load_first_track(self, index=0):
-        "Make sure the render has a track loaded, without disturbing the current one"
-        def on_status(status):
-            if status.current_track is None:
-                self.client.load_track(self.track_ids[index])
-            else:
-                self.apply_status(status)
+        """Make sure the render has a track loaded, without disturbing the current
+        one. get_current_track() is asked because both interfaces have it."""
+        def on_track(track):
+            if track is None:
+                self.client.load_track(self.track_ids[index])  # its reply refreshes
 
-        self.client.get_status(on_status)
+        self.client.get_current_track(on_track)
 
     def bind_provider(self):
         """The render has answered, so it is running, but it may be a fresh process
@@ -412,24 +445,44 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
             return
 
         self.status_pending = True
-        self.client.get_status(self.apply_status)
+        self.client.follow(self.apply_status, self.apply_track)
 
     def apply_status(self, status):
+        "The render has a playback status, so it implements the v1 interface"
         self.status_pending = False
         if not self.ready:
             self.bind_provider()
 
-        track = status.current_track
-        self.set_track_title(track.title if track and track.title else NO_TRACK)
+        self.show_controls(full=True)
+        self.show_track(status.current_track)
         self.update_button_states(status.state)
 
         with self.ui_update():
             self.repeat_button.set_active(bool(status.is_repeating))
             self.update_repeat_style()
 
+        self.update_status(STATES.get(status.state, READY))
+
+    def apply_track(self, track):
+        "The v0 interface only tells which track is loaded, not what the player does"
+        self.status_pending = False
+        if not self.ready:
+            self.bind_provider()
+
+        self.show_controls(full=False)
+        self.show_track(track)
+        self.update_button_states(None)  # there is no state to highlight
+
+        self.update_status(BASIC)
+
+    def show_track(self, track):
+        self.set_track_title(track.title if track and track.title else NO_TRACK)
         self.select_track(track.id if track else None)
 
-        self.update_status(STATES.get(status.state, READY))
+    def show_controls(self, full):
+        "The v0 interface has no pause(), previous() nor set_repeat()"
+        for button in (self.pause_button, self.previous_button, self.repeat_button):
+            button.set_visible(full)
 
     def select_track(self, track_id):
         "Mark the track the render has loaded, scrolling it into sight"

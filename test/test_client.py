@@ -1,5 +1,6 @@
 "Tests for the parts of the GUI that need neither a display nor a server"
 
+import Ice
 import pytest
 from gi.repository import GLib
 
@@ -177,6 +178,45 @@ def test_the_waiting_status_names_the_server():
 def test_the_calls_the_gui_makes_by_itself_know_their_server():
     assert OWN_CALLS == {
         'get_status': MEDIA_RENDER,
+        'get_current_track': MEDIA_RENDER,
         'bind_media_provider': MEDIA_RENDER,
         'get_all_tracks': MEDIA_PROVIDER,
     }
+
+
+def test_a_render_that_answers_get_status_implements_v1(outcome):
+    client = make_client(render=FakeProxy(result='a status'), outcome=outcome)
+
+    client.follow(outcome['results'].append, outcome['errors'].append)
+    flush()
+
+    assert client.playback_status is True
+    assert outcome['results'] == ['a status']
+
+
+def test_a_render_without_get_status_implements_v0(outcome):
+    "v0 and v1 share their type ids, so only an invocation tells them apart"
+    render = FakeProxy(error=Ice.OperationNotExistException())
+    client = make_client(render=render, outcome=outcome)
+
+    client.follow(outcome['results'].append, outcome['results'].append)
+    flush()
+
+    assert render.calls == [('get_statusAsync', ())]  # the probe
+    assert client.playback_status is False
+
+    client.follow(outcome['results'].append, outcome['results'].append)
+    flush()
+
+    assert render.calls[-1] == ('get_current_trackAsync', ())  # what v0 does have
+
+
+def test_the_interface_is_probed_again_after_losing_the_render(outcome):
+    client = make_client(render=FakeProxy(error=Ice.OperationNotExistException()), outcome=outcome)
+
+    client.follow(outcome['results'].append, outcome['results'].append)
+    flush()
+    assert client.playback_status is False
+
+    client.forget_interface()
+    assert client.playback_status is None
