@@ -6,7 +6,6 @@ import sys
 from collections import namedtuple
 from contextlib import contextmanager
 from pathlib import Path
-from time import sleep
 
 import gi
 
@@ -27,11 +26,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 WINDOW_TITLE = "Spotifice Control"
+WINDOW_WIDTH = 440
 TITLE_WIDTH = 45
 LIST_ROWS = 12    # tracks visible without scrolling
 ROW_HEIGHT = 18   # rough row height, until there is a real row to measure
-POLL_MS = 1000
+POLL_MS = 1000    # how often the render state is followed
+RETRY_MS = 3000   # how often the servers are retried while waiting for them
 ERROR_HOLD_MS = 5000  # keep errors readable in spite of the status polling
+MEDIA_PROVIDER = "media provider"
+MEDIA_RENDER = "media render"
+
+# the calls the GUI makes by itself, and the server each one needs
+OWN_CALLS = {
+    "get_status": MEDIA_RENDER,
+    "bind_media_provider": MEDIA_RENDER,
+    "get_all_tracks": MEDIA_PROVIDER,
+}
 NO_TRACK = "No track loaded"
 
 ERROR_ICON = "dialog-error-symbolic"
@@ -52,21 +62,15 @@ STATES = {
 READY = State("Ready", "", None)  # before the render tells us anything
 
 
+
 def get_proxy(ic, property, cls):
+    """An unchecked proxy, which costs no message: the servers may well not be
+    running yet, and the GUI waits for them instead of giving up."""
     proxy = ic.propertyToProxy(property)
+    if proxy is None:
+        raise RuntimeError(f'Missing property {property}')
 
-    for _ in range(5):
-        try:
-            proxy.ice_ping()
-            break
-        except Ice.ConnectionRefusedException:
-            sleep(0.5)
-
-    object = cls.checkedCast(proxy)
-    if object is None:
-        raise RuntimeError(f'Invalid proxy for {property}')
-
-    return object
+    return cls.uncheckedCast(proxy)
 
 
 def describe_error(e):
@@ -78,6 +82,11 @@ def describe_error(e):
         text = str(e) or type(e).__name__
 
     return " ".join(text.split())  # Ice messages span several lines
+
+
+def waiting_for(server):
+    "What the status bar shows while one of the servers is missing"
+    return State(f"Waiting for the {server}…", "", "content-loading-symbolic")
 
 
 def set_css_class(widget, css_class, enabled):
@@ -104,7 +113,6 @@ class SpotificeClient:
             communicator, 'Spotifice.MediaProvider.Proxy', Spotifice.MediaProviderPrx)
         render = get_proxy(
             communicator, 'Spotifice.MediaRender.Proxy', Spotifice.MediaRenderPrx)
-        render.bind_media_provider(provider)
 
         return cls(provider, render, on_error, on_changed)
 
@@ -170,7 +178,7 @@ class SpotificeClient:
 class SpotificeControlWindow(Gtk.ApplicationWindow):
     def __init__(self, app, communicator):
         super().__init__(application=app, title=WINDOW_TITLE)
-        self.set_default_size(440, -1)  # as tall as its contents need
+        self.set_default_size(WINDOW_WIDTH, -1)  # as tall as its contents need
 
         self.communicator = communicator
         self.client = self.create_client()
@@ -179,19 +187,19 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
         self.updating_ui = False   # ignore signals for changes we make ourselves
         self.status_pending = False  # a get_status() reply is on its way
         self.error_until = 0         # monotonic time while an error holds the status bar
-        self.online = True           # the render answered the last invocation
+        self.ready = False           # the render is bound and the tracks are listed
 
         self.load_css()
         self.create_ui()
-        self.load_tracks()
-        GLib.timeout_add(POLL_MS, self.poll_status)
+        self.update_status(waiting_for(MEDIA_RENDER))  # the first call goes to it
+        self.poll_status()  # without waiting for the first tick
 
     def create_client(self):
         try:
             return SpotificeClient.from_communicator(
                 self.communicator, on_error=self.on_call_failed, on_changed=self.refresh_status)
-        except Exception as e:
-            logger.error(f"Error initializing Ice proxies: {describe_error(e)}")
+        except Exception as e:  # a configuration problem, not an absent server
+            logger.error(f"Error reading the proxies: {describe_error(e)}")
             sys.exit(1)
 
     # ---- UI ----------------------------------------------------------
@@ -243,10 +251,6 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
             Spotifice.PlaybackState.STOPPED: self.stop_button,
         }
 
-        # everything that needs a reachable render
-        self.controls = [self.track_list, self.previous_button, self.play_button,
-                         self.pause_button, self.stop_button, self.repeat_button]
-
         # current track
         self.track_label = Gtk.Label(label=NO_TRACK)
         self.track_label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -266,6 +270,9 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
         statusbar.set_margin_bottom(5)
         self.status_icon = Gtk.Image()
         self.status_label = Gtk.Label(label=READY.text, xalign=0)
+        self.status_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status_label.set_max_width_chars(TITLE_WIDTH)  # a long error must not widen the window
+        self.status_label.set_hexpand(True)
         statusbar.append(self.status_icon)
         statusbar.append(self.status_label)
 
@@ -306,21 +313,10 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
 
     def set_status(self, message, icon_name, error):
         self.status_label.set_text(message)
+        self.status_label.set_tooltip_text(message)  # the whole text, if it is cut
         self.status_icon.set_from_icon_name(icon_name)
         for widget in (self.status_label, self.status_icon):
             set_css_class(widget, "status-error", error)
-
-    def set_online(self, online):
-        "The controls are useless while the render cannot be reached"
-        if online == self.online:
-            return
-
-        self.online = online
-        for widget in self.controls:
-            widget.set_sensitive(online)
-
-        if online:
-            self.rebind_render()
 
     def update_button_states(self, state):
         "Highlight the button matching the current playback state"
@@ -344,7 +340,19 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
     def on_call_failed(self, action, error):
         self.status_pending = False
         if isinstance(error, Ice.LocalException):
-            self.set_online(False)  # the middleware failed, not the operation
+            self.ready = False  # the render is gone; the next one may be a new process
+
+        server = OWN_CALLS.get(action)
+        if server:
+            # the GUI's own calls do not complain: they wait for the server they
+            # need, never bury the error of what the user pressed, and log why
+            if isinstance(error, Spotifice.BadReference):
+                server = MEDIA_PROVIDER  # the render answered: it cannot reach it
+
+            logger.info(f"Waiting for the {server}: {action}() {describe_error(error)}")
+            self.update_status(waiting_for(server))
+            return
+
         self.show_error(f"Error in {action}(): {describe_error(error)}")
 
     # ---- render state ------------------------------------------------
@@ -368,6 +376,7 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
             self.show_error("The provider has no tracks")
             return
 
+        self.ready = True
         self.load_first_track()
 
     def load_first_track(self, index=0):
@@ -380,11 +389,22 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
 
         self.client.get_status(on_status)
 
-    def rebind_render(self):
-        "A render that comes back may be a new process, with no provider bound"
+    def bind_provider(self):
+        """The render has answered, so it is running, but it may be a fresh process
+        with no provider bound. Every poll retries until the binding succeeds,
+        which also waits for a provider that is not up yet."""
         row = self.track_list.get_selected_row()
-        self.client.bind_provider(
-            lambda _result: self.load_first_track(row.get_index() if row else 0))
+        index = row.get_index() if row else 0
+
+        self.client.bind_provider(lambda _result: self.on_bound(index))
+
+    def on_bound(self, index):
+        if not self.track_ids:
+            self.load_tracks()  # only ready once they are listed
+            return
+
+        self.ready = True
+        self.load_first_track(index)
 
     def refresh_status(self):
         "Ask the render for its state; the UI follows when the reply arrives"
@@ -396,7 +416,8 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
 
     def apply_status(self, status):
         self.status_pending = False
-        self.set_online(True)
+        if not self.ready:
+            self.bind_provider()
 
         track = status.current_track
         self.set_track_title(track.title if track and track.title else NO_TRACK)
@@ -429,8 +450,11 @@ class SpotificeControlWindow(Gtk.ApplicationWindow):
             adjustment.set_value(allocation.y)
 
     def poll_status(self):
+        "Follow the render while it is there, and retry less often while it is not"
         self.refresh_status()
-        return GLib.SOURCE_CONTINUE
+        GLib.timeout_add(POLL_MS if self.ready else RETRY_MS, self.poll_status)
+
+        return GLib.SOURCE_REMOVE
 
     # ---- actions -----------------------------------------------------
 

@@ -9,8 +9,14 @@ Features:
 - Track list from `MediaProvider.get_all_tracks`: a click, or Enter, loads a track into the render.
 - Play / Pause / Stop / Previous and a repeat toggle. The button matching the current state is highlighted.
 - Periodic `get_status` polling, so the UI follows the render even when another client drives it.
-- Every invocation is asynchronous, so a slow or dead render never blocks the window. While the render is
-  unreachable the controls are disabled; when it comes back the provider is bound again and the track reloaded.
+- The servers do not have to be running first: the window opens waiting for them and the status bar names
+  the one it needs, `media render` or `media provider`, telling a render that is not there from a render
+  that cannot reach the provider. It binds and fills itself as soon as they answer, waits again if they go
+  away (retrying every few seconds), and the terminal log says why it is waiting.
+- Every invocation is asynchronous, so a slow or dead render never blocks the window.
+- No control is ever disabled and nothing is checked locally first: every button always provokes its remote
+  call, so what you see is how the remote objects answer, errors included. The status bar names the failed
+  operation, and the GUI's own calls never bury the error of what you just pressed.
 
 
 ## Install

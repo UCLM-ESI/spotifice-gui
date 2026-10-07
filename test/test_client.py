@@ -4,6 +4,9 @@ import pytest
 from gi.repository import GLib
 
 from media_control_gui import (
+    MEDIA_PROVIDER,
+    MEDIA_RENDER,
+    OWN_CALLS,
     READY,
     REPEAT_CSS_CLASS,
     STATES,
@@ -11,6 +14,7 @@ from media_control_gui import (
     Spotifice,
     SpotificeClient,
     describe_error,
+    waiting_for,
 )
 
 
@@ -163,3 +167,16 @@ def test_the_stylesheet_covers_every_highlight():
     assert f'button.{REPEAT_CSS_CLASS}' in css
     assert 'label.status-error' in css
     assert READY.css_class == ''  # no highlight before the render answers
+
+
+def test_the_waiting_status_names_the_server():
+    assert waiting_for(MEDIA_RENDER).text == 'Waiting for the media render…'
+    assert waiting_for(MEDIA_PROVIDER).icon  # an icon of its own, not an error one
+
+
+def test_the_calls_the_gui_makes_by_itself_know_their_server():
+    assert OWN_CALLS == {
+        'get_status': MEDIA_RENDER,
+        'bind_media_provider': MEDIA_RENDER,
+        'get_all_tracks': MEDIA_PROVIDER,
+    }
